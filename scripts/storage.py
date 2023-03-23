@@ -77,7 +77,7 @@ def upload_image_to_gs(image, signed_url):
 
 class Scripts(scripts.Script):
     def title(self):
-        return "Save to Image Collector"
+        return "Save to Google Storage"
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
@@ -102,7 +102,7 @@ class Scripts(scripts.Script):
         checkbox_save_to_gs = gr.inputs.Checkbox(label="Save to Image Collector", default=False)
 
         # Group the options for saving and only show them when the checkbox is checked
-        with FormGroup(visible=False, elem_id="txt2img_hires_fix") as hr_options:
+        with FormGroup(visible=False, elem_id="save_to_image_uploader") as hr_options:
             with gr.Row():
                 with gr.Column(scale=1):
                     character = gr.inputs.Dropdown(CHARACTERS, label="Character Name")
@@ -136,60 +136,27 @@ class Scripts(scripts.Script):
         ]
 
     def postprocess(self, p, processed, checkbox_save_to_gs, story, character, page, pose, notes):
+        print('postprocess')
         if not checkbox_save_to_gs:
             print("Not saving to GCS")
             return True
+
 
         # Normalize the book info
         story = story if story else "Unknown Story"
         character = character if character else "Unknown Character"
         page = page if page else "Unknown Page"
         pose = pose if pose else "Unknown Pose"
+        notes = notes if notes else ""
 
-        print("Going to save image")
         for i in range(len(processed.images)):
-            # Capture Image and upload to GCS
-            image = processed.images[i]
+            # Add metadata to image such that the save action can access
+            processed.images[i].info['story'] = story
+            processed.images[i].info['character'] = character
+            processed.images[i].info['page'] = page
+            processed.images[i].info['pose'] = pose
+            processed.images[i].info['notes'] = notes
 
-            # Add metadata to image
-            pnginfo_data = PngImagePlugin.PngInfo()
-            for k, v in image.info.items():
-                pnginfo_data.add_text(k, str(v))
-
-            # Add Book metadata
-            pnginfo_data.add_text("story", story)
-            pnginfo_data.add_text("character", character)
-            pnginfo_data.add_text("page", page)
-            pnginfo_data.add_text("pose", pose)
-            pnginfo_data.add_text("notes", notes)
-
-            # Add Additional Metadata
-            generation_info = get_generation_info(processed)
-            for k, v in generation_info.items():
-                pnginfo_data.add_text(k, str(v))
-            buffer = BytesIO()
-            image.save(buffer, "png", pnginfo=pnginfo_data)
-            image_bytes = buffer.getvalue()
-
-            service_url = str(opts.kira_image_submitter_service_url)
-            api_key = str(opts.kira_image_submitter_service_api_key)
-
-            print(f"Service URL: {service_url}")
-            print(f"Api key {api_key}")
-            if not service_url or not api_key:
-                print("Cannot save image to GCS. Service URL or API Key not set.")
-                return False
-
-            # Upload to GCS
-            image_path = get_image_path(character, story, page, pose)
-            signed_url = get_signed_url_for_prompt_image(
-                image_path,
-                service_url,
-                api_key
-            )
-            print(f"Signed URL: {signed_url}")
-            upload_image_to_gs(image_bytes, signed_url)
-            print(f"File Uploaded to {image_path}")
         return True
 
 
@@ -205,4 +172,60 @@ def on_ui_settings():
     )
 
 
+def on_image_saved(image_save_params):
+    print()
+    # Grid images are also saved and we do not want to submit these
+    # The only way to determine if the image is a grid image is
+    # - Checking the filename
+    is_grid_image = '/grid-' in image_save_params.filename
+    # - Checking if the image size does not match the prompt size
+    is_grid_sized = image_save_params.image.width != image_save_params.p.width or image_save_params.image.height != image_save_params.p.height
+    if is_grid_image or is_grid_sized:
+        print("Image is a Grid - Not Saving to Image Submitter")
+        return
+    print("Saving Image to Image Submitter")
+    print(image_save_params)
+
+    # Extract Story info from image
+    image = image_save_params.image
+    story = image.info.get('story', '-')
+    character = image.info.get('character', '-')
+    page = image.info.get('page', '-')
+    pose = image.info.get('pose', '-')
+    notes = image.info.get('notes', '')
+
+    if 'character' not in image.info:
+        print("Image does not have metadata. Not saving to GCS")
+        return
+
+    # Add metadata to image
+    pnginfo_data = PngImagePlugin.PngInfo()
+    for k, v in image.info.items():
+        pnginfo_data.add_text(k, str(v))
+
+    buffer = BytesIO()
+    image.save(buffer, "png", pnginfo=pnginfo_data)
+    image_bytes = buffer.getvalue()
+
+    service_url = str(opts.kira_image_submitter_service_url)
+    api_key = str(opts.kira_image_submitter_service_api_key)
+
+    print(f"Service URL: {service_url}")
+    print(f"Api key {api_key}")
+    if not service_url or not api_key:
+        print("Cannot save image to GCS. Service URL or API Key not set.")
+        return False
+
+    # Upload to GCS
+    image_path = get_image_path(character, story, page, pose)
+    signed_url = get_signed_url_for_prompt_image(
+        image_path,
+        service_url,
+        api_key
+    )
+    print(f"Signed URL: {signed_url}")
+    upload_image_to_gs(image_bytes, signed_url)
+    print(f"File Uploaded to {image_path}")
+
+script_callbacks.on_image_saved(on_image_saved)
 script_callbacks.on_ui_settings(on_ui_settings)
