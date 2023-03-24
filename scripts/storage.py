@@ -1,5 +1,7 @@
+import os
 from io import BytesIO
 import re
+from typing import List, Tuple
 
 import requests
 
@@ -25,6 +27,8 @@ STORIES = {
     },
 }
 
+
+# Todo: Prompicate metadata from inpainting+texttoimage
 
 def get_generation_info(processed):
     regex = r"Steps:.*$"
@@ -75,7 +79,109 @@ def upload_image_to_gs(image, signed_url):
     return response
 
 
+def build_status_info(character, story, page, pose, image_path, image_id, was_successful):
+    """Builds the status info for the upload status panel"""
+    status_color = "green" if was_successful else "red"
+    submission_status = "Submitted Successfully" if was_successful else "Submission Failed"
+    status_info = f'<br><b style="color:{status_color};">{submission_status}</b>&nbsp;&nbsp;'
+    status_info += f"(<small>ID:</small>&nbsp;{image_id}&nbsp;&nbsp;"
+    status_info += f"<small>Character:</small>&nbsp;{character}&nbsp;&nbsp;"
+    status_info += f"<small>Story:</small>&nbsp;{story}&nbsp;&nbsp;"
+    status_info += f"<small>Pose:</small>&nbsp;{pose}&nbsp;)&nbsp;"
+    return status_info
+
+
+def kira_uploader_click(status_info):
+    """Handles the click event for the Kira Uploader button"""
+    global generated_images
+    print(f"{len(generated_images)} images in generated_images")
+
+    # Check if minimum API config is available
+    if not opts.kira_image_submitter_service_url or not opts.kira_image_submitter_service_api_key:
+        status_info = f'<b style="color:red;">Please configure the API key and service URL in the settings</b>'
+        return status_info
+
+    # Check if there are any images to submit
+    if len(generated_images) == 0:
+        status_info = f'<b style="color:red;">No images found to be submitted</b>'
+        return status_info
+
+    print(f"Uploading {len(generated_images)} images to Google Storage")
+    status_info = f"<b>Images Submitted:</b></br>"
+    for image in generated_images:
+        # Extract Story info from image
+        story = image.info.get('story', '-')
+        character = image.info.get('character', '-')
+        page = image.info.get('page', '-')
+        pose = image.info.get('pose', '-')
+        notes = image.info.get('notes', '')
+
+        # Add metadata to image
+        pnginfo_data = PngImagePlugin.PngInfo()
+        for k, v in image.info.items():
+            pnginfo_data.add_text(k, str(v))
+
+        buffer = BytesIO()
+        image.save(buffer, "png", pnginfo=pnginfo_data)
+        image_bytes = buffer.getvalue()
+
+        service_url = str(opts.kira_image_submitter_service_url)
+        api_key = str(opts.kira_image_submitter_service_api_key)
+
+        print(f"Service URL: {service_url}")
+        print(f"Api key {api_key}")
+        if not service_url or not api_key:
+            print("Cannot save image to GCS. Service URL or API Key not set.")
+            return False
+
+        # Upload to GCS
+        image_path = get_image_path(character, story, page, pose)
+        image_id = image_path.split("/")[-1].split(".")[0]
+
+        was_successful = False
+        try:
+            signed_url = get_signed_url_for_prompt_image(image_path, service_url, api_key)
+            print(f"Signed URL: {signed_url}")
+            upload_image_to_gs(image_bytes, signed_url)
+            print(f"File Uploaded to {image_path}")
+            was_successful = True
+        except Exception as e:
+            print(f"Failed to get signed URL for image. Error: {e}")
+            return False
+
+        # Update status info
+        status_info += build_status_info(character, story, page, pose, image_path, image_id, was_successful)
+
+    # Clear generated images
+    generated_images = []
+    return status_info
+
+
+all_btns: List[Tuple[gr.Button, ...]] = []
+submit_symbol = '\U0001f680'  # 🚀❌⬆️🕺🐙⭐️🏹🎯🚀🛰️🏁
+tab_current = None
+generated_images = []
+
+
 class Scripts(scripts.Script):
+
+    def after_component(self, component, **kwargs):
+        global tab_current, kira_uploader_status_info
+        element = kwargs.get("elem_id")
+        if element == "extras_tab" and tab_current is not None:
+            kira_uploader_click_button = gr.Button(value=submit_symbol)
+            kira_uploader_click_button.click(
+                fn=kira_uploader_click,
+                inputs=[kira_uploader_status_info],
+                outputs=[kira_uploader_status_info],
+                _js=tab_current + "_kira_uploader_addEventListener",
+            )
+            tab_current = None
+        elif element in ["txt2img_gallery", "img2img_gallery"]:
+            tab_current = element.split("_", 1)[0]
+            with gr.Column():
+                kira_uploader_status_info = gr.HTML(elem_id=tab_current + "_kira_uploader_status_info")
+
     def title(self):
         return "Save to Google Storage"
 
@@ -137,10 +243,14 @@ class Scripts(scripts.Script):
 
     def postprocess(self, p, processed, checkbox_save_to_gs, story, character, page, pose, notes):
         print('postprocess')
-        if not checkbox_save_to_gs:
-            print("Not saving to GCS")
-            return True
+        global generated_images
 
+        # Name the process so that it can be found in the history
+        process_name = p.__class__.__name__.replace("StableDiffusion", "")
+        # Reset Images if the process is txt2img
+        if process_name == "ProcessingTxt2Img":
+            print("Resetting Generating Images Collection")
+            generated_images = []
 
         # Normalize the book info
         story = story if story else "Unknown Story"
@@ -149,13 +259,26 @@ class Scripts(scripts.Script):
         pose = pose if pose else "Unknown Pose"
         notes = notes if notes else ""
 
+        # Add generation meta data
+        generation_meta = get_generation_info(processed)
+
         for i in range(len(processed.images)):
+            image = processed.images[i]
+            is_grid_sized = image.width != processed.width or image.height != processed.height
+            if is_grid_sized:
+                print(f"Skipping image {i} because it is grid sized")
+                continue
             # Add metadata to image such that the save action can access
             processed.images[i].info['story'] = story
             processed.images[i].info['character'] = character
             processed.images[i].info['page'] = page
             processed.images[i].info['pose'] = pose
             processed.images[i].info['notes'] = notes
+            processed.images[i].info['process_name'] = process_name
+            # Add generation meta data
+            for k, v in generation_meta.items():
+                processed.images[i].info[k] = v
+            generated_images.append(processed.images[i])
 
         return True
 
@@ -172,60 +295,4 @@ def on_ui_settings():
     )
 
 
-def on_image_saved(image_save_params):
-    print()
-    # Grid images are also saved and we do not want to submit these
-    # The only way to determine if the image is a grid image is
-    # - Checking the filename
-    is_grid_image = '/grid-' in image_save_params.filename
-    # - Checking if the image size does not match the prompt size
-    is_grid_sized = image_save_params.image.width != image_save_params.p.width or image_save_params.image.height != image_save_params.p.height
-    if is_grid_image or is_grid_sized:
-        print("Image is a Grid - Not Saving to Image Submitter")
-        return
-    print("Saving Image to Image Submitter")
-    print(image_save_params)
-
-    # Extract Story info from image
-    image = image_save_params.image
-    story = image.info.get('story', '-')
-    character = image.info.get('character', '-')
-    page = image.info.get('page', '-')
-    pose = image.info.get('pose', '-')
-    notes = image.info.get('notes', '')
-
-    if 'character' not in image.info:
-        print("Image does not have metadata. Not saving to GCS")
-        return
-
-    # Add metadata to image
-    pnginfo_data = PngImagePlugin.PngInfo()
-    for k, v in image.info.items():
-        pnginfo_data.add_text(k, str(v))
-
-    buffer = BytesIO()
-    image.save(buffer, "png", pnginfo=pnginfo_data)
-    image_bytes = buffer.getvalue()
-
-    service_url = str(opts.kira_image_submitter_service_url)
-    api_key = str(opts.kira_image_submitter_service_api_key)
-
-    print(f"Service URL: {service_url}")
-    print(f"Api key {api_key}")
-    if not service_url or not api_key:
-        print("Cannot save image to GCS. Service URL or API Key not set.")
-        return False
-
-    # Upload to GCS
-    image_path = get_image_path(character, story, page, pose)
-    signed_url = get_signed_url_for_prompt_image(
-        image_path,
-        service_url,
-        api_key
-    )
-    print(f"Signed URL: {signed_url}")
-    upload_image_to_gs(image_bytes, signed_url)
-    print(f"File Uploaded to {image_path}")
-
-script_callbacks.on_image_saved(on_image_saved)
 script_callbacks.on_ui_settings(on_ui_settings)
